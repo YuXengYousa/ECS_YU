@@ -5,7 +5,8 @@
                否则 unordered_map 无法自行就地构造 elem
 2024/4/4 TODO：原作者使用 world_.entities_.emplace(entity) 无恙，原因有待查明
 2024/4/5 NOTE: unordered_map::emplace()返回参数详见cpp reference介绍，可以解答以上的部分疑问
-2024/4/5 NOTE: 优化实现了延迟销毁，其中对 Resource 的延迟销毁使用了与原作者不同的设计
+2024/4/5 NOTE: 优化实现了 Entity,Resource 延迟销毁，其中对 Resource 的延迟销毁使用了与原作者不同的设计
+2024/4/5 TODO: 计划实现 Entity 延迟创建，涉及保存 Component 类型参数的构造、析构、赋值信息
 */
 #pragma once
 
@@ -13,6 +14,8 @@
 #include <cassert>
 #include <unordered_map>
 #include <vector>
+#include <optional>
+#include <functional>
 
 #include "sparse_sets.hpp"
 
@@ -48,6 +51,99 @@ class IDGenerator final {
   inline static T cur_id_ = {};
 };
 
+template<typename T>
+class EventStaging final {
+ public:
+  static void Set(const T& t) { event_ = t; }
+  
+  static void Set(T&& t) { event_ = std::move(t); }
+
+  static T& Get() {  return *event_; }
+
+  static bool Has() { return event_ != std::nullopt; }
+
+  static void Clear() { event_ = std::nullopt; }
+
+ private:
+   inline static std::optional<T> event_ = std::nullopt;
+};
+
+template<typename T>
+class EventReader final {
+ public:
+   bool Has() { return EventStaging<T>::Has(); }
+    
+   const T& Get() { return EventStaging<T>::Get(); }
+
+   void Clear() { EventStaging<T>::Clear(); }
+
+   operator bool() { return EventStaging<T>::Has(); }
+};
+
+class World;
+
+class Events final {
+ public:
+  friend class World;
+
+  template<typename T>
+  friend class EventWriter;
+
+  template<typename T>
+  auto Reader();
+
+  template<typename T>
+  auto Writer();
+
+ private:
+  std::vector<std::function<void (void)>> add_event_funcs_;
+  std::vector<void (*)(void)> remove_event_funcs_;
+
+  void addAllEvents() {
+    for (auto func : add_event_funcs_) {
+      func();
+    }
+    add_event_funcs_.clear();
+  }
+
+  void removeEventRead() {
+    for (auto func : remove_event_funcs_) {
+      func();
+    }
+    remove_event_funcs_.clear();
+  }
+};
+
+template<typename T>
+class EventWriter final {
+ public:
+  EventWriter(Events& e) : events_(e) {}
+ 
+  void Write(const T& t);
+
+  // WirteImmediate
+
+ private:
+   Events& events_;
+};
+
+template <typename T>
+auto Events::Reader() {
+   remove_event_funcs_.push_back([](){ EventStaging<T>::Clear(); });
+   return EventReader<T> {};
+}
+
+template<typename T>
+auto Events::Writer() {
+  return EventWriter<T> {};
+}
+
+template<typename T>
+void EventWriter<T>::Write(const T& t) {
+  events_.add_event_funcs_.push_back([=]() { EventStaging<T>::Set(t); });
+}
+
+
 using EntityGenerator = IDGenerator<Entity>;
 
 class Commands;
@@ -55,7 +151,7 @@ class Resources;
 class Queryer;
 
 using StartUpSystem = void(*)(Commands&);
-using UpdateSystem = void(*)(Commands&, Queryer, Resources); 
+using UpdateSystem = void(*)(Commands&, Queryer, Resources, Events&); 
 
 class World final {
  public:
@@ -165,6 +261,7 @@ class World final {
   std::unordered_map<ComponentId, ResourceInfo> resources_;
   std::vector<StartUpSystem> startup_systems_;
   std::vector<UpdateSystem> update_systems_;
+  Events events_;
 };
 
 
@@ -380,9 +477,12 @@ inline void World::StartUp() {
 inline void World::Update() {
   Commands command(*this);
   for (auto sys : update_systems_) {
-    sys(command, Queryer(*this), Resources(*this));
+    sys(command, Queryer(*this), Resources(*this), events_);
   }
   command.Execute();
+
+  events_.removeEventRead();
+  events_.addAllEvents();
 }
 
 template <typename T>
